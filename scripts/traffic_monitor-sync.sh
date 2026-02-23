@@ -156,7 +156,7 @@ tmp_ips="$(mktemp)"
 trap 'rm -f "$tmp_ips"' EXIT
 
 awk '{print $3}' "$LEASES_FILE" \
-  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+  | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' \
   | sort -u > "$tmp_ips"
 
 lease_count="$(wc -l < "$tmp_ips" | tr -d ' ')"
@@ -166,9 +166,6 @@ if [ "$lease_count" = "0" ]; then
   log warn "No DHCP IPs found in $LEASES_FILE. No rules added."
   exit 0
 fi
-
-added=0
-kept=0
 
 # Note: counters like added/kept inside while may not propagate in some /bin/sh implementations.
 # We log per-IP actions anyway, plus a final snapshot count.

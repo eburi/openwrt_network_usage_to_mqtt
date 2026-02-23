@@ -42,6 +42,7 @@ need_cmd grep
 need_cmd ip
 need_cmd date
 need_cmd logger
+need_cmd mktemp
 
 # ---------- helpers ----------
 pub() {
@@ -51,10 +52,25 @@ pub() {
 
   # -r for retained messages
   if [ "$retain" = "true" ]; then
-    mosquitto_pub -h "$BROKER" -u "$MQTT_USER" -P "$MQTT_PASS" -r -t "$topic" -m "$payload" >/dev/null 2>&1
+    if ! err="$(mosquitto_pub -h "$BROKER" -u "$MQTT_USER" -P "$MQTT_PASS" -r -t "$topic" -m "$payload" 2>&1)"; then
+      log warn "MQTT publish failed topic=$topic retain=true error=${err:-unknown}"
+    fi
   else
-    mosquitto_pub -h "$BROKER" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$topic" -m "$payload" >/dev/null 2>&1
+    if ! err="$(mosquitto_pub -h "$BROKER" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$topic" -m "$payload" 2>&1)"; then
+      log warn "MQTT publish failed topic=$topic retain=false error=${err:-unknown}"
+    fi
   fi
+}
+
+json_escape() {
+  printf '%s' "$1" | awk 'BEGIN { ORS="" } {
+    gsub(/\\/,"\\\\")
+    gsub(/"/,"\\\"")
+    gsub(/\t/,"\\t")
+    gsub(/\r/,"\\r")
+    if (NR > 1) printf "\\n"
+    printf "%s", $0
+  }'
 }
 
 # From DHCP lease: ip -> (mac, hostname)
@@ -96,6 +112,7 @@ publish_discovery_for_mac() {
 
   mac_id="$(echo "$mac" | tr ':' '_')"     # valid for entity unique_id/object_id
   dev_name="LAN ${name}"
+  dev_name_json="$(json_escape "$dev_name")"
   dev_id="openwrt_${mac_id}"
 
   # Bytes IN sensor
@@ -104,7 +121,7 @@ publish_discovery_for_mac() {
   state_in="$BASE_TOPIC/$mac/in"
 
   payload_in=$(cat <<EOF
-{"name":"${dev_name} In Bytes","state_topic":"${state_in}","value_template":"{{ value_json.bytes }}","unique_id":"${dev_id}_in_bytes","device_class":"data_size","unit_of_measurement":"B","state_class":"total_increasing","device":{"identifiers":["${dev_id}"],"name":"${dev_name}","model":"OpenWrt nft counters","manufacturer":"OpenWrt","connections":[["mac","${mac}"]]}}
+{"name":"${dev_name_json} In Bytes","state_topic":"${state_in}","value_template":"{{ value_json.bytes }}","unique_id":"${dev_id}_in_bytes","device_class":"data_size","unit_of_measurement":"B","state_class":"total_increasing","device":{"identifiers":["${dev_id}"],"name":"${dev_name_json}","model":"OpenWrt nft counters","manufacturer":"OpenWrt","connections":[["mac","${mac}"]]}}
 EOF
 )
   pub "$topic_in" "$payload_in" true
@@ -115,7 +132,7 @@ EOF
   state_out="$BASE_TOPIC/$mac/out"
 
   payload_out=$(cat <<EOF
-{"name":"${dev_name} Out Bytes","state_topic":"${state_out}","value_template":"{{ value_json.bytes }}","unique_id":"${dev_id}_out_bytes","device_class":"data_size","unit_of_measurement":"B","state_class":"total_increasing","device":{"identifiers":["${dev_id}"],"name":"${dev_name}","model":"OpenWrt nft counters","manufacturer":"OpenWrt","connections":[["mac","${mac}"]]}}
+{"name":"${dev_name_json} Out Bytes","state_topic":"${state_out}","value_template":"{{ value_json.bytes }}","unique_id":"${dev_id}_out_bytes","device_class":"data_size","unit_of_measurement":"B","state_class":"total_increasing","device":{"identifiers":["${dev_id}"],"name":"${dev_name_json}","model":"OpenWrt nft counters","manufacturer":"OpenWrt","connections":[["mac","${mac}"]]}}
 EOF
 )
   pub "$topic_out" "$payload_out" true
@@ -147,13 +164,18 @@ publish_state() {
 
   name="$(ip_to_name "$ipaddr")"
 
-  # Publish discovery once per run (cheap, retained; HA ignores duplicates)
-  publish_discovery_for_mac "$mac" "$name"
+  # Publish discovery once per MAC in this run
+  if ! grep -Fxq "$mac" "$SEEN_MACS_FILE" 2>/dev/null; then
+    publish_discovery_for_mac "$mac" "$name"
+    printf '%s\n' "$mac" >> "$SEEN_MACS_FILE"
+  fi
+
+  name_json="$(json_escape "$name")"
 
   topic="$BASE_TOPIC/$mac/$dir"
   ts="$(date +%s)"
   payload=$(printf '{"ip":"%s","mac":"%s","name":"%s","dir":"%s","bytes":%s,"packets":%s,"ts":%s}' \
-    "$ipaddr" "$mac" "$name" "$dir" "$bytes" "$packets" "$ts")
+    "$ipaddr" "$mac" "$name_json" "$dir" "$bytes" "$packets" "$ts")
 
   log info "Publishing state to $topic payload=$payload"
   pub "$topic" "$payload" false
@@ -161,6 +183,9 @@ publish_state() {
 
 # ---------- main ----------
 log info "Starting. broker=$BROKER base_topic=$BASE_TOPIC discovery=$DISCOVERY_PREFIX table=$TABLE_FAMILY/$TABLE_NAME chain=$CHAIN_NAME tag=$TAG leases=$LEASES_FILE level=$LOG_LEVEL"
+
+SEEN_MACS_FILE="$(mktemp)"
+trap 'rm -f "$SEEN_MACS_FILE"' EXIT
 
 # Sanity checks
 nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 || die "Missing nft table: $TABLE_FAMILY $TABLE_NAME"
