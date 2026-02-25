@@ -109,6 +109,162 @@ Topic: `network/usage/<mac>/in` and `.../out`
 
 ---
 
+## How it works: nft rules and jq
+
+### Rules added per device
+
+`traffic_monitor-sync.sh` creates two rules per DHCP-leased IP in an `inet` table with a `forward` chain hooked at priority 0. The chain is type `filter`, so it sees all forwarded packets passing through the router.
+
+```
+table inet traffic_monitor {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        ip saddr 192.168.46.128 counter comment "tm:192.168.46.128:out"  # handle 4
+        ip daddr 192.168.46.128 counter comment "tm:192.168.46.128:in"   # handle 5
+    }
+}
+```
+
+- `ip saddr <ip>` — matches packets **from** the device (outbound from device's perspective)
+- `ip daddr <ip>` — matches packets **to** the device (inbound to device)
+- `counter` — the kernel accumulates `packets` and `bytes` in-place; no userspace daemon needed
+- The comment `tm:<ip>:dir` is the tag used to identify and manage rules by both scripts
+- Rules never drop traffic — the chain policy is `accept`
+
+Rules are pruned automatically when an IP leaves DHCP leases. The handle (numeric rule ID) is used for deletion.
+
+---
+
+### nft JSON output (`nft -j`)
+
+Both scripts use `nft -j list chain inet traffic_monitor forward` to read counters as structured JSON, avoiding fragile text parsing. A single rule looks like:
+
+```json
+{
+  "family": "inet",
+  "table": "traffic_monitor",
+  "chain": "forward",
+  "handle": 5,
+  "comment": "tm:192.168.46.128:in",
+  "expr": [
+    {
+      "match": {
+        "op": "==",
+        "left": { "payload": { "protocol": "ip", "field": "daddr" } },
+        "right": "192.168.46.128"
+      }
+    },
+    {
+      "counter": {
+        "packets": 22762,
+        "bytes": 11791165
+      }
+    }
+  ]
+}
+```
+
+The full chain output wraps all rules in a top-level array:
+
+```json
+{
+  "nftables": [
+    { "metainfo": { "version": "1.1.1", ... } },
+    { "chain": { "family": "inet", "table": "traffic_monitor", "name": "forward", ... } },
+    { "rule": { ... } },
+    { "rule": { ... } }
+  ]
+}
+```
+
+---
+
+### How jq extracts counter data
+
+**`mqtt-traffic.sh` — reading bytes and packets for all tracked rules:**
+
+```sh
+nft -j list chain inet traffic_monitor forward \
+  | jq -r --arg tag "tm:" '
+      .nftables[] | .rule?
+      | select((.comment // "") | startswith($tag))
+      | (.comment | split(":")) as $c
+      | [ $c[1], $c[2],
+          (.expr[] | .counter?.bytes   // empty | tostring),
+          (.expr[] | .counter?.packets // empty | tostring)
+        ]
+      | join(" ")
+    '
+```
+
+Output (one line per rule, `ip dir bytes packets`):
+
+```
+192.168.46.123 out 142176 1348
+192.168.46.123 in  593079 1303
+192.168.46.128 out 13348220 19756
+192.168.46.128 in  11791165 22762
+```
+
+- `.nftables[] | .rule?` — iterate objects, keep only rule entries (skip metainfo, chain)
+- `select(... | startswith($tag))` — filter to only our tagged rules; `startswith()` is used because OpenWrt's `jq` build lacks ONIGURUMA regex (`test`/`match`)
+- `(.comment | split(":")) as $c` — splits `"tm:192.168.46.128:in"` → `["tm","192.168.46.128","in"]`
+- `.expr[] | .counter?.bytes // empty` — iterates the `expr` array, picks up the counter object
+
+---
+
+**`traffic_monitor-sync.sh` — checking if a rule already exists:**
+
+```sh
+nft -j list chain inet traffic_monitor forward \
+  | jq -e --arg cmt "tm:192.168.46.128:in" '
+      .nftables[] | .rule? | select(.comment == $cmt)
+    '
+```
+
+`jq -e` exits non-zero when no match is found — used directly as a shell condition.
+
+---
+
+**`traffic_monitor-sync.sh` — finding handles of stale rules to delete:**
+
+```sh
+nft -j list chain inet traffic_monitor forward \
+  | jq -r --arg tag "tm:" '
+      .nftables[] | .rule?
+      | select((.comment // "") | startswith($tag))
+      | [(.handle | tostring), (.comment | split(":")[1])]
+      | join(" ")
+    '
+```
+
+Output (`handle ip`):
+
+```
+2 192.168.46.123
+3 192.168.46.123
+4 192.168.46.128
+5 192.168.46.128
+```
+
+Stale rules are deleted by handle: `nft delete rule inet traffic_monitor forward handle <n>`
+
+---
+
+### Bandwidth calculation
+
+`mqtt-traffic.sh` takes two counter snapshots `BW_INTERVAL` seconds apart (default 5 s), then computes delta with `awk`:
+
+```sh
+delta = bytes_snap2 - bytes_snap1
+bw    = delta / BW_INTERVAL          # bytes/s
+```
+
+If the counter decreased (router reboot between snapshots), delta is clamped to 0.
+
+---
+
 ## Configuration reference
 
 | Variable | Default | Description |
