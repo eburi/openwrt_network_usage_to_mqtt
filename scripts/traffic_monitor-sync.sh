@@ -1,8 +1,13 @@
-# Creates/maintains per-device nftables counter rules automatically from DHCP leases, with logging.
+#!/bin/sh
+# Creates/maintains per-device nftables counter rules automatically from DHCP leases.
 #
 # Rules are tagged by comment:
 #   "tm:<ip>:out" (ip saddr <ip>)
 #   "tm:<ip>:in"  (ip daddr <ip>)
+#
+# Stale rules (IP no longer in DHCP leases) are pruned automatically.
+# The corresponding mqtt-traffic.sh state files are left in STATE_DIR; they
+# are harmless and will be overwritten if the device returns with the same MAC.
 #
 # Logs go to:
 #   - stderr (console when run manually)
@@ -13,7 +18,6 @@
 # Extra shell trace:
 #   sh -x /usr/bin/traffic_monitor-sync.sh
 
-#!/bin/sh
 set -eu
 
 TABLE_FAMILY="inet"
