@@ -65,10 +65,10 @@ need_cmd() {
 }
 
 need_cmd nft
+need_cmd jq
 need_cmd awk
 need_cmd grep
 need_cmd sort
-need_cmd sed
 need_cmd mktemp
 need_cmd date
 need_cmd logger
@@ -94,19 +94,13 @@ ensure_nft_objects() {
 }
 
 rule_exists() {
-  ip="$1"
-  dir="$2" # out|in
-
-  if [ "$dir" = "out" ]; then
-    pat="ip saddr $ip"
-    cmt="$TAG:$ip:out"
-  else
-    pat="ip daddr $ip"
-    cmt="$TAG:$ip:in"
-  fi
-
-  nft -a list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
-    | grep -F "$pat" | grep -F "comment \"$cmt\"" >/dev/null 2>&1
+  ip="$1" dir="$2"
+  # Use nft -j + jq -e: exits 0 only when a matching rule object is found.
+  # --arg passes the comment string safely without shell quoting inside jq.
+  nft -j list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
+    | jq -e --arg cmt "$TAG:$ip:$dir" \
+        '.nftables[] | .rule? | select(.comment == $cmt)' \
+        > /dev/null 2>&1
 }
 
 add_rules_for_ip() {
@@ -134,13 +128,21 @@ prune_stale_rules() {
 
   log debug "Pruning rules not in current DHCP IP list: $current_ips_file"
 
-  nft -a list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
-    | sed -n 's/.*ip \(saddr\|daddr\) \([0-9.]\+\).*comment "'"$TAG"':[^\"]\+".*handle \([0-9]\+\).*/\2 \3/p' \
-    | while read -r ip handle; do
+  # Extract handle + IP for every rule tagged with our prefix.
+  # Output: "<handle> <ip>" per line – no regex library needed, only startswith().
+  nft -j list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
+    | jq -r --arg tag "${TAG}:" '
+        .nftables[] | .rule?
+        | select((.comment // "") | startswith($tag))
+        | [(.handle | tostring), (.comment | split(":")[1])]
+        | join(" ")
+      ' \
+    | while read -r handle ip; do
         [ -n "$ip" ] || continue
         if ! grep -qx "$ip" "$current_ips_file"; then
           log info "Deleting stale rule handle=$handle for ip=$ip (no longer in leases)"
-          nft delete rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" handle "$handle" || log warn "Failed to delete handle=$handle"
+          nft delete rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" handle "$handle" \
+            || log warn "Failed to delete handle=$handle"
         else
           log debug "Keeping rule for ip=$ip (still in leases)"
         fi
@@ -183,12 +185,18 @@ done < "$tmp_ips"
 prune_stale_rules "$tmp_ips"
 
 # Final rule summary
-rule_lines="$(nft -a list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null | grep -F "comment \"$TAG:" | wc -l | tr -d ' ' || true)"
+rule_lines="$(nft -j list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
+  | jq --arg tag "${TAG}:" '[.nftables[] | .rule? | select((.comment // "") | startswith($tag))] | length' \
+  || echo 0)"
 log info "Done. managed_rule_lines=$rule_lines (should be ~2 per active leased IP)"
 
-# Debug tip: show managed rules quickly
-log debug "Managed rules (grep):"
+# Debug: show all managed rules as compact JSON objects
 if should_log debug; then
-  nft -a list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
-    | grep -F "comment \"$TAG:" >&2 || true
+  log debug "Managed rules:"
+  nft -j list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
+    | jq -r --arg tag "${TAG}:" '
+        .nftables[] | .rule?
+        | select((.comment // "") | startswith($tag))
+        | "  handle=\(.handle) comment=\(.comment) bytes=\(.expr[] | .counter?.bytes // 0)"
+      ' >&2 || true
 fi

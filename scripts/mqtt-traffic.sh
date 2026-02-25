@@ -53,8 +53,8 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $
 
 need_cmd nft
 need_cmd mosquitto_pub
+need_cmd jq
 need_cmd awk
-need_cmd sed
 need_cmd grep
 need_cmd ip
 need_cmd date
@@ -108,9 +108,20 @@ ip_to_name() {
 
 # ---------- nft ----------
 # Output one line per tracked rule: "<ip> <dir> <bytes> <packets>"
+# Uses nft -j (JSON) output parsed with jq – no regex library required;
+# startswith() is sufficient since ONIGURUMA is not available on OpenWrt jq.
 get_counters() {
-  nft -a list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
-    | sed -n 's/.*counter packets \([0-9]*\) bytes \([0-9]*\) comment "'"$TAG"':\([0-9.]*\):\(in\|out\)".*/\3 \4 \2 \1/p'
+  nft -j list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" 2>/dev/null \
+    | jq -r --arg tag "${TAG}:" '
+        .nftables[] | .rule?
+        | select((.comment // "") | startswith($tag))
+        | (.comment | split(":")) as $c
+        | [ $c[1], $c[2],
+            (.expr[] | .counter?.bytes   // empty | tostring),
+            (.expr[] | .counter?.packets // empty | tostring)
+          ]
+        | join(" ")
+      '
 }
 
 # ---------- per-MAC+dir state ----------
