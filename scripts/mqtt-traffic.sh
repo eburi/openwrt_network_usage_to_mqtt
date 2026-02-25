@@ -177,7 +177,7 @@ publish_discovery() {
     case "$dir" in in) lbl="In";; *) lbl="Out";; esac
 
     _disc "${dir}_bytes"  "$lbl Total"     '{{ value_json.bytes }}'   "B"   "total_increasing" "data_size"
-    _disc "${dir}_bw"     "$lbl Bandwidth" '{{ value_json.bw }}'      "B/s" "measurement"
+    _disc "${dir}_bw"     "$lbl Bandwidth" '{{ value_json.bw }}'      "B/s" "measurement"      "data_rate"
     _disc "${dir}_daily"  "$lbl Daily"     '{{ value_json.daily }}'   "B"   "measurement"       "data_size"
     _disc "${dir}_weekly" "$lbl Weekly"    '{{ value_json.weekly }}'  "B"   "measurement"       "data_size"
   done
